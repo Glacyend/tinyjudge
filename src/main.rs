@@ -65,7 +65,6 @@ fn run_judge(cli: &CliArgs, config: &ProblemConfig) -> Result<Verdict, JudgeErro
     judge::check_source_file_name(&cli.source, config)?;
     judge::check_data_files(&cli.data_dir, config)?;
 
-    // Path of the compiled artifact, if compilation is required.
     let output_path = if config.compile.needs_compile {
         Some(judge::output_path(&cli.source, config))
     } else {
@@ -74,7 +73,6 @@ fn run_judge(cli: &CliArgs, config: &ProblemConfig) -> Result<Verdict, JudgeErro
 
     let outcome = judge::compile(&cli.source, config)?;
 
-    // Handle compilation first: if it failed, we can already decide the verdict.
     let executable: PathBuf = match &outcome {
         CompileOutcome::Failed(message) => {
             eprint!("{message}");
@@ -93,7 +91,6 @@ fn run_judge(cli: &CliArgs, config: &ProblemConfig) -> Result<Verdict, JudgeErro
 
     let verdicts = judge::run_testcases(config, &cli.data_dir, &executable)?;
 
-    // Clean up the compiled artifact (if any) before reporting results.
     if let Some(path) = output_path {
         judge::cleanup_output(&path);
     }
@@ -134,6 +131,23 @@ fn run_judge(cli: &CliArgs, config: &ProblemConfig) -> Result<Verdict, JudgeErro
                     ),
                     None => println!(
                         "Test case {}: Runtime Error (terminated by signal) (0 points)",
+                        index
+                    ),
+                }
+            }
+            TestcaseVerdict::TimeLimitExceeded => {
+                all_accepted = false;
+                println!("Test case {}: Time Limit Exceeded (0 points)", index);
+            }
+            TestcaseVerdict::MemoryLimitExceeded { peak_mb } => {
+                all_accepted = false;
+                match peak_mb {
+                    Some(mb) => println!(
+                        "Test case {}: Memory Limit Exceeded ({} MB) (0 points)",
+                        index, mb
+                    ),
+                    None => println!(
+                        "Test case {}: Memory Limit Exceeded (virtual memory) (0 points)",
                         index
                     ),
                 }

@@ -1,7 +1,7 @@
 {
     "name": "aplusb",
-    "time_limit_ms": 1500,
-    "memory_limit_mb": 128,
+    "time_limit_ms": 1000,
+    "memory_limit_mb": 1,
     "data_prefix": "test",
     "testcase_count": 3,
     "compile": {

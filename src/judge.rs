@@ -4,7 +4,9 @@ use std::{
     error::Error,
     fmt, fs, io,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::config::ProblemConfig;
@@ -31,6 +33,8 @@ pub enum TestcaseVerdict {
     Accepted,
     WrongAnswer(WrongAnswerDetail),
     RuntimeError { exit_code: Option<i32> },
+    TimeLimitExceeded,
+    MemoryLimitExceeded { peak_mb: Option<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +50,8 @@ impl fmt::Display for TestcaseVerdict {
             TestcaseVerdict::Accepted => write!(f, "Accepted"),
             TestcaseVerdict::WrongAnswer(_) => write!(f, "Wrong Answer"),
             TestcaseVerdict::RuntimeError { .. } => write!(f, "Runtime Error"),
+            TestcaseVerdict::TimeLimitExceeded => write!(f, "Time Limit Exceeded"),
+            TestcaseVerdict::MemoryLimitExceeded { .. } => write!(f, "Memory Limit Exceeded"),
         }
     }
 }
@@ -147,7 +153,6 @@ pub fn check_source_file_name(source: &Path, config: &ProblemConfig) -> Result<(
 pub fn check_data_files(data_dir: &Path, config: &ProblemConfig) -> Result<(), JudgeError> {
     let mut problems: Vec<String> = Vec::new();
 
-    // 1. Every expected file must be present.
     for index in 0..config.testcase_count {
         let input = data_dir.join(config.input_file_name(index));
         let output = data_dir.join(config.output_file_name(index));
@@ -159,7 +164,6 @@ pub fn check_data_files(data_dir: &Path, config: &ProblemConfig) -> Result<(), J
         }
     }
 
-    // 2. No unexpected files may appear.
     for entry in fs::read_dir(data_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -268,6 +272,126 @@ pub fn compile(source: &Path, config: &ProblemConfig) -> Result<CompileOutcome, 
     }
 }
 
+enum RunOutcome {
+    Completed {
+        status: Option<ExitStatus>,
+        cpu: Duration,
+        peak_rss_bytes: u64,
+    },
+    VirtualMemoryExceeded,
+}
+
+#[cfg(unix)]
+fn run_timed(
+    command: &mut Command,
+    hard_limit: Duration,
+    memory_limit_bytes: u64,
+) -> Result<RunOutcome, JudgeError> {
+    use std::os::unix::process::CommandExt;
+
+    // Restrict the child's virtual address space. This makes `exec` fail
+    // with ENOMEM when a program declares more memory than the limit --
+    // including a huge uninitialized BSS, which never shows up in RSS.
+    let rlim = memory_limit_bytes as libc::rlim_t;
+    unsafe {
+        command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: rlim,
+                rlim_max: rlim,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) if e.raw_os_error() == Some(libc::ENOMEM) => {
+            // `exec` failed because the virtual memory limit was too small.
+            return Ok(RunOutcome::VirtualMemoryExceeded);
+        }
+        Err(e) => return Err(JudgeError::Io(e)),
+    };
+    let pid = child.id() as libc::pid_t;
+    drop(child);
+
+    let start = Instant::now();
+    loop {
+        let mut raw_status: libc::c_int = 0;
+        let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::wait4(pid, &mut raw_status, libc::WNOHANG, &mut rusage) };
+
+        if ret == pid {
+            use std::os::unix::process::ExitStatusExt;
+            return Ok(RunOutcome::Completed {
+                status: Some(ExitStatus::from_raw(raw_status)),
+                cpu: rusage_cpu(&rusage),
+                peak_rss_bytes: rusage_rss_bytes(&rusage),
+            });
+        }
+
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                let mut s: libc::c_int = 0;
+                libc::wait4(pid, &mut s, 0, std::ptr::null_mut());
+            }
+            return Err(JudgeError::Io(err));
+        }
+
+        let now = start.elapsed();
+        if now >= hard_limit {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let mut final_status: libc::c_int = 0;
+            let mut final_rusage: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::wait4(pid, &mut final_status, 0, &mut final_rusage) };
+            return Ok(RunOutcome::Completed {
+                status: None,
+                cpu: rusage_cpu(&final_rusage),
+                peak_rss_bytes: rusage_rss_bytes(&final_rusage),
+            });
+        }
+
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(not(unix))]
+fn run_timed(
+    _command: &mut Command,
+    _hard_limit: Duration,
+    _memory_limit_bytes: u64,
+) -> Result<RunOutcome, JudgeError> {
+    Err(JudgeError::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "resource measurement is only implemented on Unix",
+    )))
+}
+
+#[cfg(unix)]
+fn rusage_cpu(rusage: &libc::rusage) -> Duration {
+    let secs = rusage.ru_utime.tv_sec as u64 + rusage.ru_stime.tv_sec as u64;
+    let usecs = rusage.ru_utime.tv_usec as u64 + rusage.ru_stime.tv_usec as u64;
+    Duration::from_secs(secs) + Duration::from_micros(usecs)
+}
+
+#[cfg(unix)]
+fn rusage_rss_bytes(rusage: &libc::rusage) -> u64 {
+    let raw = rusage.ru_maxrss as u64;
+    // Linux and most Unix report `ru_maxrss` in kibibytes; macOS reports bytes.
+    #[cfg(target_os = "macos")]
+    {
+        raw
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        raw * 1024
+    }
+}
+
 pub fn run_testcases(
     config: &ProblemConfig,
     data_dir: &Path,
@@ -279,7 +403,6 @@ pub fn run_testcases(
         config.name
     ));
 
-    // Make sure no stale file from a previous run lingers around.
     let _ = fs::remove_file(&temp_path);
 
     let result = (|| -> Result<Vec<TestcaseVerdict>, JudgeError> {
@@ -292,23 +415,49 @@ pub fn run_testcases(
 
             let stdin_file = fs::File::open(&input_path)?;
             let stdout_file = fs::File::create(&temp_path)?;
-
-            let status = command
+            command
                 .stdin(Stdio::from(stdin_file))
                 .stdout(Stdio::from(stdout_file))
-                .stderr(Stdio::null())
-                .status()?;
+                .stderr(Stdio::null());
 
-            let verdict = if status.success() {
-                let actual = fs::read_to_string(&temp_path)?;
-                let expected = fs::read_to_string(&expected_path)?;
-                match compare_output(&actual, &expected) {
-                    Some(detail) => TestcaseVerdict::WrongAnswer(detail),
-                    None => TestcaseVerdict::Accepted,
+            let time_limit = Duration::from_millis(config.time_limit_ms);
+            let hard_limit = time_limit + Duration::from_millis(200);
+            let memory_limit_bytes = config.memory_limit_mb * 1024 * 1024;
+
+            let outcome = run_timed(&mut command, hard_limit, memory_limit_bytes)?;
+
+            let verdict = match outcome {
+                RunOutcome::VirtualMemoryExceeded => {
+                    TestcaseVerdict::MemoryLimitExceeded { peak_mb: None }
                 }
-            } else {
-                TestcaseVerdict::RuntimeError {
-                    exit_code: status.code(),
+                RunOutcome::Completed {
+                    status,
+                    cpu,
+                    peak_rss_bytes,
+                } => {
+                    let peak_mb = peak_rss_bytes / (1024 * 1024);
+                    if peak_rss_bytes > memory_limit_bytes {
+                        TestcaseVerdict::MemoryLimitExceeded {
+                            peak_mb: Some(peak_mb),
+                        }
+                    } else if status.is_none() || cpu > time_limit {
+                        TestcaseVerdict::TimeLimitExceeded
+                    } else if let Some(status) = status {
+                        if status.success() {
+                            let actual = fs::read_to_string(&temp_path)?;
+                            let expected = fs::read_to_string(&expected_path)?;
+                            match compare_output(&actual, &expected) {
+                                Some(detail) => TestcaseVerdict::WrongAnswer(detail),
+                                None => TestcaseVerdict::Accepted,
+                            }
+                        } else {
+                            TestcaseVerdict::RuntimeError {
+                                exit_code: status.code(),
+                            }
+                        }
+                    } else {
+                        unreachable!("`status` is always `Some` unless the process was killed")
+                    }
                 }
             };
             verdicts.push(verdict);
