@@ -1,0 +1,14 @@
+{
+    "name": "aplusb",
+    "time_limit_ms": 1500,
+    "memory_limit_mb": 128,
+    "data_prefix": "test",
+    "testcase_count": 3,
+    "compile": {
+        "language": "C++",
+        "source_file": "main.cpp",
+        "needs_compile": true,
+        "output_file": "main",
+        "compile_command": "g++ -std=c++23 ${INPUT_FILE} -o ${OUTPUT_FILE}"
+    }
+}
